@@ -84,7 +84,7 @@ static int busIdToCudaDev(int64_t busId) {
   return -1;
 }
 
-NCCL_PARAM(P2pUseCudaMemcpy, "P2P_USE_CUDA_MEMCPY", 0);
+NCCL_PARAM(P2pUseCudaMemcpy, "P2P_USE_CUDA_MEMCPY", 1);
 static int useMemcpy = 0;
 static void initCeOperation();
 
@@ -168,7 +168,7 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclTopoSystem* topo, struct ncclTop
 
 
 // Setting this to non zero causes P2P to use Reads rather than Writes
-NCCL_PARAM(P2pReadEnable, "P2P_READ_ENABLE", -2);
+NCCL_PARAM(P2pReadEnable, "P2P_READ_ENABLE", 0);
 NCCL_PARAM(P2pDirectDisable, "P2P_DIRECT_DISABLE", 0);
 
 static ncclResult_t p2pGetInfo(struct ncclTopoSystem* topo, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2, int* read, int* intermediateRank) {
