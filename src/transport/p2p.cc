@@ -9,6 +9,8 @@
 #include "utils.h"
 #include "shm.h"
 
+#define MERGE_MEMCPY  1
+
 struct ncclP2pBuff {
   void* directPtr;
   cudaIpcMemHandle_t devIpc;
@@ -17,6 +19,8 @@ struct ncclP2pBuff {
 struct p2pConnectInfo {
   int rank;
   int read;
+  int graphId;
+  int channelId;
   struct ncclP2pBuff p2pBuff;
   // Use by CE memcpy
   char shmName[7];
@@ -38,6 +42,7 @@ struct p2pProxyInfo {
   // Intermediate step for sender
   struct ncclRecvMem* ceRecvMem;
   char* ceDevBuff;
+  int* offsets;
 
   // Receiver buffer
   char* recvFifo;
@@ -217,6 +222,8 @@ ncclResult_t p2pSendSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   static_assert(sizeof(struct p2pConnectInfo) <= sizeof(struct ncclConnect), "p2p Connect Info is too big");
   struct p2pConnectInfo* info = (struct p2pConnectInfo*)connectInfo;
   info->read = useRead;
+  info->graphId = graph->id;
+  info->channelId = channelId;
   // For CollNet, use write for scatter-reduce (conn 1), read for broadcast-gather (conn 0)
   if (graph && connIndex == 1) info->read = 0;
   const char* useReadStr = info->read ? "/read" : "";
@@ -269,6 +276,8 @@ ncclResult_t p2pRecvSetup(struct ncclComm* comm, struct ncclTopoGraph* graph, st
   static_assert(sizeof(struct p2pConnectInfo) <= sizeof(struct ncclConnect), "p2p Connect Info is too big");
   struct p2pConnectInfo* info = (struct p2pConnectInfo*)connectInfo;
   info->read = useRead;
+  info->graphId = graph->id;
+  info->channelId = channelId;
   // For CollNet, use write for scatter-reduce (conn 1), read for broadcast-gather (conn 0)
   if (graph && connIndex == 1) info->read = 0;
 
@@ -322,6 +331,15 @@ static ncclResult_t p2pSendConnect(struct ncclComm* comm, struct ncclConnect* co
     // Send SIMPLE buff to proxy, and replace it by local buffer
     NCCLCHECK(ncclProxyCall(&send->proxyConn, ncclProxyMsgConnect, &send->conn.buffs[NCCL_PROTO_SIMPLE], sizeof(void*), NULL, 0));
     send->conn.buffs[NCCL_PROTO_SIMPLE] = resources->proxyInfo.ceDevBuff;
+#if (MERGE_MEMCPY == 1)
+    int stepSize = send->comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+    for (int i=0; i<NCCL_STEPS; ++i) {
+      resources->proxyInfo.offsets[i] =
+          stepSize*(i*comm->nChannels + info->channelId + info->graphId*NCCL_STEPS*comm->nChannels);
+    }
+    NCCLCHECK(ncclCudaCalloc(&send->conn.offsFifo, NCCL_STEPS));
+    NCCLCHECK(ncclCudaMemcpy(send->conn.offsFifo, resources->proxyInfo.offsets, NCCL_STEPS));
+#endif
   } else {
     send->conn.tail = &remDevMem->tail;
     send->conn.head = &resources->devMem->head;
@@ -369,6 +387,15 @@ ncclResult_t p2pRecvConnect(struct ncclComm* comm, struct ncclConnect* connectIn
       buff += recv->comm->buffSizes[p];
     }
   }
+#if (MERGE_MEMCPY == 1)
+  int offsets[NCCL_STEPS];
+  NCCLCHECK(ncclCudaCalloc(&recv->conn.offsFifo, NCCL_STEPS));
+  int stepSize = recv->comm->buffSizes[NCCL_PROTO_SIMPLE]/NCCL_STEPS;
+  for (int i=0; i<NCCL_STEPS; ++i) {
+    offsets[i] = stepSize*(i*comm->nChannels + info->channelId + info->graphId*NCCL_STEPS*comm->nChannels);
+  }
+  NCCLCHECK(ncclCudaMemcpy(recv->conn.offsFifo, offsets, NCCL_STEPS));
+#endif
   return ncclSuccess;
 }
 
@@ -397,7 +424,18 @@ static ncclResult_t p2pSendProxySetup(struct ncclProxyConnection* connection, st
     NCCLCHECK(ncclCalloc(&proxyInfo, 1));
     connection->transportResources = proxyInfo;
 
+#if (MERGE_MEMCPY == 1)
+    if (comm->p2pProxySendMem) {
+      comm->p2pProxySendBuffCnt++;
+    } else {
+      NCCLCHECK(ncclCudaCalloc(&comm->p2pProxySendMem, comm->buffSizes[NCCL_PROTO_SIMPLE]*comm->nChannels*3)); // 3: ring, tree, coll
+      comm->p2pProxySendBuffCnt = 1;
+    }
+    proxyInfo->ceDevBuff = comm->p2pProxySendMem;
+    NCCLCHECK(ncclCalloc(&proxyInfo->offsets, NCCL_STEPS));
+#else
     NCCLCHECK(ncclCudaCalloc(&proxyInfo->ceDevBuff, comm->buffSizes[NCCL_PROTO_SIMPLE]));
+#endif
 
     char shmPath[PATH_MAX];
     shmPath[0] = '\0';
@@ -434,7 +472,18 @@ static ncclResult_t p2pRecvProxySetup(struct ncclProxyConnection* connection, st
   int size = *((int*)reqBuff);
   if (respSize != sizeof(struct ncclP2pBuff)) return ncclInternalError;
   struct ncclP2pBuff* p2pBuff = (struct ncclP2pBuff*)respBuff;
+#if (MERGE_MEMCPY == 1)
+  if (comm->p2pProxyRecvMem) {
+    if (comm->p2pProxyRecvBuffSize != size) return ncclInternalError;
+  } else {
+    NCCLCHECK(ncclCudaCalloc(&comm->p2pProxyRecvMem, size*comm->nChannels*3)); // 3: ring, tree, coll
+    comm->p2pProxyRecvBuffCnt = 1;
+    comm->p2pProxyRecvBuffSize = size;
+  }
+  p2pBuff->directPtr = comm->p2pProxyRecvMem;
+#else
   NCCLCHECK(ncclCudaCalloc((char**)&p2pBuff->directPtr, size));
+#endif
   connection->transportResources = p2pBuff->directPtr;
   cudaError_t res = cudaIpcGetMemHandle(&p2pBuff->devIpc, p2pBuff->directPtr);
   if (res != cudaSuccess) {
@@ -466,7 +515,16 @@ static ncclResult_t p2pSendProxyFree(struct ncclProxyConnection* connection, str
     struct p2pProxyInfo* proxyInfo = (struct p2pProxyInfo*)connection->transportResources;
     NCCLCHECK(ncclShmClose(proxyInfo->shm, proxyInfo->devShm, proxyInfo->shmSize));
     NCCLCHECK(ncclCudaHostFree(proxyInfo->ceRecvMem));
+#if (MERGE_MEMCPY == 1)
+    if (comm->p2pProxySendBuffCnt > 1) {
+      if (--comm->p2pProxySendBuffCnt == 0) {
+        CUDACHECK(cudaFree(comm->p2pProxySendMem));
+        comm->p2pProxySendMem = nullptr;
+      }
+    }
+#else
     CUDACHECK(cudaFree(proxyInfo->ceDevBuff));
+#endif
     CUDACHECK(cudaStreamDestroy(proxyInfo->stream));
     for (int i=0; i<NCCL_STEPS; i++) {
       CUDACHECK(cudaEventDestroy(proxyInfo->events[i]));
@@ -499,7 +557,9 @@ static ncclResult_t p2pSendProxyProgress(struct ncclComm* comm, struct ncclProxy
   args->idle = 1;
   if (args->state == ncclProxyOpProgress) {
     int p = args->protocol;
+#if (MERGE_MEMCPY == 0)
     int stepSize = comm->buffSizes[p] / NCCL_STEPS;
+#endif
     for (int s=0; s<args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs+s;
       struct p2pProxyInfo* resources = (struct p2pProxyInfo*) (sub->connection->transportResources);
@@ -508,18 +568,64 @@ static ncclResult_t p2pSendProxyProgress(struct ncclComm* comm, struct ncclProxy
           args->done++;
           continue;
       }
-      if (sub->transmitted < sub->done + NCCL_STEPS && sub->transmitted < sub->nsteps) {
+      int cont;
+#if (MERGE_MEMCPY == 1)
+      cont = 1;
+      while (sub->done < sub->transmitted && cont) {
+        cont = 0;
+        int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
+        cudaError_t res = cudaEventQuery(resources->events[buffSlot]);
+        if (res != cudaErrorNotReady) CUDACHECK(res);
+        if (res == cudaSuccess) {
+          sub->done += args->sliceSteps;
+          // Notify SHM
+          resources->shm->recvMem.tail = sub->base + sub->done;
+          cont = 1;
+        }
+        if (sub->done == sub->nsteps) {
+          resources->step = sub->base + sub->nsteps;
+          args->done++;
+        }
+      }
+#endif
+      cont = 1;
+      while (sub->transmitted < sub->done + NCCL_STEPS && sub->transmitted < sub->nsteps && cont) {
+        cont = 0;
         int buffSlot = (sub->base+sub->transmitted)%NCCL_STEPS;
+#if (MERGE_MEMCPY == 0)
         volatile int* sizesFifo = resources->ceRecvMem->sizesFifo;
+#endif
         volatile uint64_t* recvTail = &resources->ceRecvMem->tail;
         // Check GPU has sent everything
         if ((*recvTail > sub->base+sub->transmitted)) {
+#if (MERGE_MEMCPY == 1)
+          int bidx = -1;
+          for (int i=0; i<2; ++i) {
+            if (comm->memcpyDstBase[i] == nullptr) {
+              comm->memcpyDstBase[i] = resources->recvFifo;
+              bidx = i;
+              break;
+            } else if (comm->memcpyDstBase[i] == resources->recvFifo) {
+              bidx = i;
+              break;
+            }
+          }
+          if (bidx == -1) return ncclInternalError;
+          struct ncclMemcpyInfo* mi = &comm->memcpyInfo[bidx][comm->memcpyInfoCnt[bidx]];
+          mi->proxyInfo = resources;
+          mi->buffSlot = buffSlot;
+          mi->channelId = sub->channelId;
+          comm->memcpyInfoCnt[bidx]++;
+#else
           int size = sizesFifo[buffSlot];
           CUDACHECK(cudaMemcpyAsync(resources->recvFifo+buffSlot*stepSize, resources->ceDevBuff+buffSlot*stepSize, size, cudaMemcpyDeviceToDevice, resources->stream));
           CUDACHECK(cudaEventRecord(resources->events[buffSlot], resources->stream));
+#endif
           sub->transmitted += args->sliceSteps;
+          cont = 1;
         }
       }
+#if (MERGE_MEMCPY == 0)
       if (sub->done < sub->transmitted) {
         int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
         cudaError_t res = cudaEventQuery(resources->events[buffSlot]);
@@ -534,11 +640,98 @@ static ncclResult_t p2pSendProxyProgress(struct ncclComm* comm, struct ncclProxy
           args->done++;
         }
       }
+#endif
     }
     if (args->done == args->nsubs) {
       args->state = ncclProxyOpNone;
     }
   }
+#if (MERGE_MEMCPY == 1)
+  if (args->next == nullptr) {
+    for (int bidx=0; bidx<2; ++bidx) {
+      if (comm->memcpyInfoCnt[bidx] == 0) continue;
+      struct p2pProxyInfo* rsrcs[NCCL_STEPS][MAXCHANNELS];
+      int sizes[NCCL_STEPS][MAXCHANNELS];
+      for (int i=0; i<NCCL_STEPS; ++i) {
+        for (int j=0; j<MAXCHANNELS; ++j) {
+          sizes[i][j] = 0;
+        }
+      }
+      for (int i=0; i<comm->memcpyInfoCnt[bidx]; ++i) {
+        struct p2pProxyInfo* resources = (struct p2pProxyInfo*)comm->memcpyInfo[bidx][i].proxyInfo;
+        int buffSlot = comm->memcpyInfo[bidx][i].buffSlot;
+        int channelId = comm->memcpyInfo[bidx][i].channelId;
+        volatile int* sizesFifo = resources->ceRecvMem->sizesFifo;
+        sizes[buffSlot][channelId] = sizesFifo[buffSlot];
+        rsrcs[buffSlot][channelId] = resources;
+      }
+      int stepSize = comm->buffSizes[NCCL_PROTO_SIMPLE] / NCCL_STEPS;
+      int cumStart = -1;
+      int cumSize = 0;
+      for (int i=0; i<NCCL_STEPS; ++i) {
+        for (int j=0; j<comm->nChannels; ++j) {
+          int size = sizes[i][j];
+          if (size < stepSize || (size == stepSize && i == NCCL_STEPS-1 && j == comm->nChannels-1)) {
+            if (cumStart == -1) {
+              if (size > 0) {
+                struct p2pProxyInfo* resources = rsrcs[i][j];
+                char* dst = resources->recvFifo + resources->offsets[i];
+                const char* src = resources->ceDevBuff + resources->offsets[i];
+                CUDACHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, resources->stream));
+                CUDACHECK(cudaEventRecord(resources->events[i], resources->stream));
+              }
+            } else {
+              int iStart = cumStart / comm->nChannels;
+              int jStart = cumStart % comm->nChannels;
+              struct p2pProxyInfo* resources = rsrcs[iStart][jStart];
+#if 0
+              // No merging for debugging purposes
+              for (int k=cumStart; k<j+comm->nChannels*i; ++k) {
+                int ii = k / comm->nChannels;
+                int jj = k % comm->nChannels;
+                char* dst = rsrcs[ii][jj]->recvFifo + rsrcs[ii][jj]->offsets[ii];
+                const char* src = rsrcs[ii][jj]->ceDevBuff + rsrcs[ii][jj]->offsets[ii];
+                INFO(NCCL_ALL, "changho: ------ real copy dst %p src %p size %d", dst, src, sizes[ii][jj]);
+                CUDACHECK(cudaMemcpyAsync(dst, src, sizes[ii][jj], cudaMemcpyDeviceToDevice, rsrcs[ii][jj]->stream));
+                CUDACHECK(cudaEventRecord(rsrcs[ii][jj]->events[ii], rsrcs[ii][jj]->stream));
+              }
+              if (size > 0) {
+                char* dst = rsrcs[i][j]->recvFifo + rsrcs[i][j]->offsets[i];
+                const char* src = rsrcs[i][j]->ceDevBuff + rsrcs[i][j]->offsets[i];
+                INFO(NCCL_ALL, "changho: ------ real copy dst %p src %p size %d", dst, src, sizes[i][j]);
+                CUDACHECK(cudaMemcpyAsync(dst, src, sizes[i][j], cudaMemcpyDeviceToDevice, rsrcs[i][j]->stream));
+                CUDACHECK(cudaEventRecord(rsrcs[i][j]->events[i], rsrcs[i][j]->stream));
+              }
+#else
+              char* dst = resources->recvFifo + resources->offsets[iStart];
+              const char* src = resources->ceDevBuff + resources->offsets[iStart];
+              CUDACHECK(cudaMemcpyAsync(dst, src, cumSize+size, cudaMemcpyDeviceToDevice, resources->stream));
+              for (int k=cumStart; k<j+comm->nChannels*i; ++k) {
+                int ii = k / comm->nChannels;
+                int jj = k % comm->nChannels;
+                CUDACHECK(cudaEventRecord(rsrcs[ii][jj]->events[ii], resources->stream));
+              }
+              if (size > 0) {
+                CUDACHECK(cudaEventRecord(rsrcs[i][j]->events[i], resources->stream));
+              }
+#endif
+              cumStart = -1;
+              cumSize = 0;
+            }
+          } else if (size == stepSize) {
+            if (cumStart == -1) {
+              cumStart = j + comm->nChannels * i;
+            }
+            cumSize += size;
+          } else {
+            return ncclInternalError;
+          }
+        }
+      }
+      comm->memcpyInfoCnt[bidx] = 0;
+    }
+  }
+#endif
   return ncclSuccess;
 }
 
