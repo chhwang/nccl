@@ -153,6 +153,12 @@ struct ncclKernelPlan {
   } channels[MAXCHANNELS];
 };
 
+struct ncclMemcpyInfo {
+  void *proxyInfo;
+  int buffSlot;
+  int channelId;
+};
+
 struct ncclComm {
   struct ncclMemoryStack memPermanent, memScoped;
   // List of destructors to run when comm is destructed
@@ -200,6 +206,15 @@ struct ncclComm {
   int p2pnChannels;
   int p2pnChannelsPerPeer;
   int p2pChannels[MAXCHANNELS];
+  // For p2p proxy buffers
+  char *p2pProxySendMem;
+  char *p2pProxyRecvMem;
+  int p2pProxySendBuffCnt;
+  int p2pProxyRecvBuffCnt;
+  int p2pProxyRecvBuffSize;
+  struct ncclMemcpyInfo memcpyInfo[2][MAXCHANNELS*NCCL_STEPS];
+  char *memcpyDstBase[2];
+  int memcpyInfoCnt[2];
 
   // Buffer sizes
   int buffSizes[NCCL_NUM_PROTOCOLS];
