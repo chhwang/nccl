@@ -4,6 +4,8 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include <vector>
+
 #include "comm.h"
 #include "graph.h"
 #include "utils.h"
@@ -32,6 +34,13 @@ struct p2pShm {
   struct ncclSendMem sendMem;
   struct ncclRecvMem recvMem;
 };
+struct p2pMemcpyEvent {
+  cudaEvent_t ev;
+  int cnt;
+  int flag;
+  struct p2pMemcpyEvent* tracking;
+  std::vector<struct p2pMemcpyEvent*> trackers;
+};
 struct p2pProxyInfo {
   // Shared memory between proxy and receiving GPU
   struct p2pShm* shm;
@@ -50,7 +59,7 @@ struct p2pProxyInfo {
   // Used by progress only
   uint64_t step;
   cudaStream_t stream;
-  cudaEvent_t events[NCCL_STEPS];
+  struct p2pMemcpyEvent events[NCCL_STEPS];
 };
 static_assert(sizeof(p2pConnectInfo) <= CONNECT_SIZE, "P2P Connect info is too large");
 
@@ -175,6 +184,91 @@ ncclResult_t p2pCanConnect(int* ret, struct ncclTopoSystem* topo, struct ncclTop
 // Setting this to non zero causes P2P to use Reads rather than Writes
 NCCL_PARAM(P2pReadEnable, "P2P_READ_ENABLE", -2);
 NCCL_PARAM(P2pDirectDisable, "P2P_DIRECT_DISABLE", 0);
+
+static ncclResult_t p2pMemcpyEventCreate(struct p2pMemcpyEvent *e)
+{
+  if (cudaEventCreateWithFlags(&e->ev, cudaEventDisableTiming) != cudaSuccess) return ncclInternalError;
+  e->flag = 1;
+  e->tracking = nullptr;
+  e->trackers.clear();
+  return ncclSuccess;
+}
+static ncclResult_t p2pMemcpyEventDestroy(struct p2pMemcpyEvent *e)
+{
+  if (cudaEventDestroy(e->ev) != cudaSuccess) return ncclInternalError;
+  e->trackers.clear();
+  return ncclSuccess;
+}
+static ncclResult_t p2pMemcpyEventRecord(struct p2pMemcpyEvent *e, cudaStream_t s)
+{
+  if (e->flag != 1) {
+    WARN("Overwriting an unresolved event record.");
+  }
+  if (!e->trackers.empty()) {
+    for (std::vector<struct p2pMemcpyEvent *>::iterator it = e->trackers.begin();
+          it != e->trackers.end(); ++it) {
+      (*it)->flag = e->flag;
+    }
+    e->trackers.clear();
+  }
+  if (cudaEventRecord(e->ev, s) != cudaSuccess) return ncclInternalError;
+  e->flag = 0;
+  e->tracking = nullptr;
+  return ncclSuccess;
+}
+static ncclResult_t p2pMemcpyEventTrack(struct p2pMemcpyEvent *e, struct p2pMemcpyEvent *t)
+{
+  // Tracker should not track another tracker
+  if (t->tracking) return ncclInternalError;
+  if (!e->trackers.empty()) return ncclInternalError;
+  e->tracking = t;
+  e->flag = t->flag;
+  if (!t->flag) t->trackers.emplace_back(e);
+  return ncclSuccess;
+}
+static ncclResult_t p2pMemcpyEventUntrack(struct p2pMemcpyEvent *e)
+{
+  if (e->tracking) {
+    if (!e->flag) {
+      for (std::vector<struct p2pMemcpyEvent *>::iterator it = e->tracking->trackers.begin();
+           it != e->tracking->trackers.end(); ++it) {
+        if (*it == e) {
+          e->tracking->trackers.erase(it);
+          break;
+        }
+      }
+      e->flag = 1;
+    }
+    e->tracking = nullptr;
+  }
+  return ncclSuccess;
+}
+static ncclResult_t p2pMemcpyEventQuery(struct p2pMemcpyEvent *e, int *result)
+{
+  if (e->flag == 1) {
+    *result = 1;
+    return ncclSuccess;
+  }
+  if (e->tracking) {
+    if (p2pMemcpyEventQuery(e->tracking, result) != ncclSuccess) return ncclInternalError;
+    return ncclSuccess;
+  }
+  cudaError_t err = cudaEventQuery(e->ev);
+  if (err == cudaSuccess) {
+    e->flag = 1;
+    *result = 1;
+    for (std::vector<struct p2pMemcpyEvent *>::iterator it = e->trackers.begin();
+          it != e->trackers.end(); ++it) {
+      (*it)->flag = 1;
+    }
+    e->trackers.clear();
+    return ncclSuccess;
+  } else if (err == cudaErrorNotReady) {
+    *result = 0;
+    return ncclSuccess;
+  }
+  return ncclInternalError;
+}
 
 static ncclResult_t p2pGetInfo(struct ncclTopoSystem* topo, struct ncclPeerInfo* info1, struct ncclPeerInfo* info2, int* read, int* intermediateRank) {
   int p2p;
@@ -504,7 +598,7 @@ static ncclResult_t p2pSendProxyConnect(struct ncclProxyConnection* connection, 
 
   CUDACHECK(cudaStreamCreateWithFlags(&proxyInfo->stream, cudaStreamNonBlocking));
   for (int i=0; i<NCCL_STEPS; i++) {
-    CUDACHECK(cudaEventCreate(proxyInfo->events+i));
+    NCCLCHECK(p2pMemcpyEventCreate(proxyInfo->events+i));
   }
   connection->proxyAppendPtr = &connection->proxyAppend;
   return ncclSuccess;
@@ -527,7 +621,7 @@ static ncclResult_t p2pSendProxyFree(struct ncclProxyConnection* connection, str
 #endif
     CUDACHECK(cudaStreamDestroy(proxyInfo->stream));
     for (int i=0; i<NCCL_STEPS; i++) {
-      CUDACHECK(cudaEventDestroy(proxyInfo->events[i]));
+      NCCLCHECK(p2pMemcpyEventDestroy(&proxyInfo->events[i]));
     }
     free(proxyInfo);
   } else {
@@ -574,9 +668,11 @@ static ncclResult_t p2pSendProxyProgress(struct ncclComm* comm, struct ncclProxy
       while (sub->done < sub->transmitted && cont) {
         cont = 0;
         int buffSlot = (sub->base+sub->done)%NCCL_STEPS;
-        cudaError_t res = cudaEventQuery(resources->events[buffSlot]);
-        if (res != cudaErrorNotReady) CUDACHECK(res);
-        if (res == cudaSuccess) {
+        int result;
+        NCCLCHECK(p2pMemcpyEventQuery(&resources->events[buffSlot], &result));
+        if (result) {
+          // Untrack if it is a tracker
+          NCCLCHECK(p2pMemcpyEventUntrack(&resources->events[buffSlot]));
           sub->done += args->sliceSteps;
           // Notify SHM
           resources->shm->recvMem.tail = sub->base + sub->done;
@@ -678,7 +774,7 @@ static ncclResult_t p2pSendProxyProgress(struct ncclComm* comm, struct ncclProxy
                 char* dst = resources->recvFifo + resources->offsets[i];
                 const char* src = resources->ceDevBuff + resources->offsets[i];
                 CUDACHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, resources->stream));
-                CUDACHECK(cudaEventRecord(resources->events[i], resources->stream));
+                NCCLCHECK(p2pMemcpyEventRecord(&resources->events[i], resources->stream));
               }
             } else {
               int iStart = cumStart / comm->nChannels;
@@ -706,13 +802,14 @@ static ncclResult_t p2pSendProxyProgress(struct ncclComm* comm, struct ncclProxy
               char* dst = resources->recvFifo + resources->offsets[iStart];
               const char* src = resources->ceDevBuff + resources->offsets[iStart];
               CUDACHECK(cudaMemcpyAsync(dst, src, cumSize+size, cudaMemcpyDeviceToDevice, resources->stream));
-              for (int k=cumStart; k<j+comm->nChannels*i; ++k) {
+              NCCLCHECK(p2pMemcpyEventRecord(&resources->events[iStart], resources->stream));
+              for (int k=cumStart+1; k<j+comm->nChannels*i; ++k) {
                 int ii = k / comm->nChannels;
                 int jj = k % comm->nChannels;
-                CUDACHECK(cudaEventRecord(rsrcs[ii][jj]->events[ii], resources->stream));
+                NCCLCHECK(p2pMemcpyEventTrack(&rsrcs[ii][jj]->events[ii], &resources->events[iStart]));
               }
               if (size > 0) {
-                CUDACHECK(cudaEventRecord(rsrcs[i][j]->events[i], resources->stream));
+                NCCLCHECK(p2pMemcpyEventTrack(&rsrcs[i][j]->events[i], &resources->events[iStart]));
               }
 #endif
               cumStart = -1;
