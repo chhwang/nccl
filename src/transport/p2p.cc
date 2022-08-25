@@ -597,6 +597,9 @@ static ncclResult_t p2pSendProxyConnect(struct ncclProxyConnection* connection, 
   proxyInfo->recvFifo = *((char**)reqBuff);
 
   CUDACHECK(cudaStreamCreateWithFlags(&proxyInfo->stream, cudaStreamNonBlocking));
+  if (!comm->p2pProxyCopyStream) {
+    CUDACHECK(cudaStreamCreateWithFlags(&comm->p2pProxyCopyStream, cudaStreamNonBlocking));
+  }
   for (int i=0; i<NCCL_STEPS; i++) {
     NCCLCHECK(p2pMemcpyEventCreate(proxyInfo->events+i));
   }
@@ -620,6 +623,10 @@ static ncclResult_t p2pSendProxyFree(struct ncclProxyConnection* connection, str
     CUDACHECK(cudaFree(proxyInfo->ceDevBuff));
 #endif
     CUDACHECK(cudaStreamDestroy(proxyInfo->stream));
+    if (comm->p2pProxyCopyStream) {
+      CUDACHECK(cudaStreamDestroy(comm->p2pProxyCopyStream));
+      comm->p2pProxyCopyStream = nullptr;
+    }
     for (int i=0; i<NCCL_STEPS; i++) {
       NCCLCHECK(p2pMemcpyEventDestroy(&proxyInfo->events[i]));
     }
@@ -773,8 +780,8 @@ static ncclResult_t p2pSendProxyProgress(struct ncclComm* comm, struct ncclProxy
                 struct p2pProxyInfo* resources = rsrcs[i][j];
                 char* dst = resources->recvFifo + resources->offsets[i];
                 const char* src = resources->ceDevBuff + resources->offsets[i];
-                CUDACHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, resources->stream));
-                NCCLCHECK(p2pMemcpyEventRecord(&resources->events[i], resources->stream));
+                CUDACHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, comm->p2pProxyCopyStream));
+                NCCLCHECK(p2pMemcpyEventRecord(&resources->events[i], comm->p2pProxyCopyStream));
               }
             } else {
               int iStart = cumStart / comm->nChannels;
@@ -801,8 +808,8 @@ static ncclResult_t p2pSendProxyProgress(struct ncclComm* comm, struct ncclProxy
 #else
               char* dst = resources->recvFifo + resources->offsets[iStart];
               const char* src = resources->ceDevBuff + resources->offsets[iStart];
-              CUDACHECK(cudaMemcpyAsync(dst, src, cumSize+size, cudaMemcpyDeviceToDevice, resources->stream));
-              NCCLCHECK(p2pMemcpyEventRecord(&resources->events[iStart], resources->stream));
+              CUDACHECK(cudaMemcpyAsync(dst, src, cumSize+size, cudaMemcpyDeviceToDevice, comm->p2pProxyCopyStream));
+              NCCLCHECK(p2pMemcpyEventRecord(&resources->events[iStart], comm->p2pProxyCopyStream));
               for (int k=cumStart+1; k<j+comm->nChannels*i; ++k) {
                 int ii = k / comm->nChannels;
                 int jj = k % comm->nChannels;

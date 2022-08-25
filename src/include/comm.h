@@ -212,6 +212,7 @@ struct ncclComm {
   int p2pProxySendBuffCnt;
   int p2pProxyRecvBuffCnt;
   int p2pProxyRecvBuffSize;
+  cudaStream_t p2pProxyCopyStream;
   struct ncclMemcpyInfo memcpyInfo[2][MAXCHANNELS*NCCL_STEPS];
   char *memcpyDstBase[2];
   int memcpyInfoCnt[2];
