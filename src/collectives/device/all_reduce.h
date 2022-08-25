@@ -36,8 +36,7 @@ namespace {
     for (ssize_t gridOffset = 0; gridOffset < size; gridOffset += loopSize) {
       ssize_t realChunkSize;
       if (Proto::Id == NCCL_PROTO_SIMPLE) {
-        realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels*nranks));
-        realChunkSize = roundUp(realChunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));
+        realChunkSize = roundUp(chunkSize, (nthreads-WARP_SIZE)*sizeof(uint64_t)/sizeof(T));
       }
       else
         realChunkSize = min(chunkSize, divUp(size-gridOffset, nChannels*nranks*minChunkSize)*minChunkSize);
