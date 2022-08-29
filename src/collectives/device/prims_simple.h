@@ -132,7 +132,7 @@ class Primitives<
     constexpr int Src = SrcBuf != -1;
     constexpr int Dst = DstBuf != -1;
 
-    nelem = nelem < 0 ? 0 : nelem;
+    if (nelem <= 0) return;
     int sliceSize = stepSize*StepPerSlice;
     sliceSize = max(divUp(nelem, 16*SlicePerChunk)*16, sliceSize/32);
     int slice = 0;
